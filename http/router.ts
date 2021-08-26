@@ -9,24 +9,6 @@ import { Status, STATUS_TEXT } from "./http_status.ts";
 const ERROR_INVALID_ROUTE = new Deno.errors.Http("Invalid route");
 
 /**
- * Retrieves the Host on which the URL is sought. For HTTP/1 (RFC 7230, section
- * 5.4), this is either the value of the "Host" header or the host name given
- * in the URL itself. For HTTP/2, it is the value of the ":authority" pseudo-
- * header field.
- *
- * @param {Headers} headers The request headers.
- * @param {URL} url The request url.
- * @returns {string} The host.
- * @private
- */
-function _getHost(headers: Headers, { protocol, host }: URL): string {
-  // TODO: for HTTP/2 use the ":authority" pseudo-header.
-  const hostHeader = headers.get("host");
-
-  return hostHeader ? new URL(`${protocol}${hostHeader}`).host : host;
-}
-
-/**
  * Retrieves the Hostname (Host without Port). For HTTP/1 (RFC 7230, section
  * 5.4), this is either the value of the "Host" header or the host name given
  * in the URL itself. For HTTP/2, it is the value of the ":authority" pseudo-
@@ -39,27 +21,11 @@ function _getHost(headers: Headers, { protocol, host }: URL): string {
  * @returns {string} The hostname (host without port).
  * @private
  */
-function _getHostname(headers: Headers, { protocol, hostname }: URL) {
+function _getHostname(headers: Headers, url: URL): string {
   // TODO: for HTTP/2 use the ":authority" pseudo-header.
   const hostHeader = headers.get("host");
 
-  return hostHeader ? new URL(`${protocol}${hostHeader}`).hostname : hostname;
-}
-
-/**
- * Normalizes the request path.
- *
- * @param {string} pathname The request path.
- * @returns {string} The normalized path.
- */
-function _getNormalizedPath(pathname: string): string {
-  if (pathname === "") {
-    return "/";
-  }
-
-  const path = pathname[0] === "/" ? pathname : `/${pathname}`;
-
-  return normalize(path);
+  return hostHeader ? new URL(`proto://${hostHeader}`).hostname : url.hostname;
 }
 
 /**
@@ -68,6 +34,7 @@ function _getNormalizedPath(pathname: string): string {
  * @param {URL} url The request URL.
  * @param {Status} status The redirect status code.
  * @returns {Handler} A "Redirect" handler.
+ * @private
  */
 function _redirectHandler(url: URL, status: Status): Handler {
   return function _redirect(): Response {
@@ -82,6 +49,7 @@ function _redirectHandler(url: URL, status: Status): Handler {
  * response and status code.
  *
  * @returns {Handler} A "Not Found" handler.
+ * @private
  */
 function _notFoundHandler(): Handler {
   const status = Status.NotFound;
@@ -148,48 +116,15 @@ export class Router {
       }
     }
 
-    if (!path.length) {
-      return false;
-    }
+    const hasTrailingSlash = path.at(-1) === "/";
 
     for (const route of routes) {
       if (this.#routeMap.has(`${route}/`)) {
-        return path.at(-1) !== "/";
+        return !hasTrailingSlash;
       }
     }
 
     return false;
-  }
-
-  /**
-   * Determines if the given path needs a "/" appended to it.
-   *
-   * This occurs if there are no registered handlers for the path, but there is
-   * for the path + "/".
-   *
-   * If it is determined that a redirect is needed, a new URL is constructed
-   * with the updated path containing the trailing slash.
-   *
-   * @param {string} host The host to match against registered routes.
-   * @param {string} path The path to match against registered routes.
-   * @param {URL} url The request url.
-   * @returns {Object} Whether the handler should redirect, and if so, the redirect url.
-   * @private
-   */
-  #redirectToPathSlash(
-    host: string,
-    path: string,
-    url: URL,
-  ): { redirectUrl?: URL; redirect: boolean } {
-    if (!this.#shouldRedirect(host, path)) {
-      return { redirect: false };
-    }
-
-    const redirectUrl = new URL(url.toString());
-    path += "/";
-    redirectUrl.pathname = path;
-
-    return { redirectUrl, redirect: true };
   }
 
   /**
@@ -248,37 +183,13 @@ export class Router {
    */
   #getHandler(request: Request): Handler {
     const requestUrl = new URL(request.url);
-
-    if (request.method === "CONNECT") {
-      const { redirect, redirectUrl } = this.#redirectToPathSlash(
-        requestUrl.host,
-        requestUrl.pathname,
-        requestUrl,
-      );
-
-      if (redirect) {
-        return _redirectHandler(
-          redirectUrl!,
-          Status.MovedPermanently,
-        );
-      }
-
-      const host = _getHost(request.headers, requestUrl);
-
-      return this.#matchHandler(host, requestUrl.pathname);
-    }
-
     const hostname = _getHostname(request.headers, requestUrl);
-    const path = _getNormalizedPath(requestUrl.pathname);
+    const path = normalize(requestUrl.pathname);
 
-    const { redirect, redirectUrl } = this.#redirectToPathSlash(
-      hostname,
-      path,
-      requestUrl,
-    );
+    if (this.#shouldRedirect(hostname, path)) {
+      requestUrl.pathname = `${path}/`;
 
-    if (redirect) {
-      return _redirectHandler(redirectUrl!, Status.MovedPermanently);
+      return _redirectHandler(requestUrl!, Status.MovedPermanently);
     }
 
     if (path !== requestUrl.pathname) {
@@ -297,9 +208,6 @@ export class Router {
    *
    * If the url path is not in it's canonical form, the handler will redirect
    * the request to the canonical path.
-   *
-   * If the host contains a port, it will be ignored when matching handlers
-   * except for CONNECT requests where the host is consumed unchanged.
    *
    * If there is no registered handler for the route a 404 "Not Found" response
    * will be sent.
